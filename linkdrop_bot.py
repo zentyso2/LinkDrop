@@ -1,0 +1,612 @@
+"""
+LinkDrop - Tek Dosyalık Telegram Video İndirme Botu
+=====================================================
+TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter) linklerini indirir.
+
+Kurulum:
+    pip install aiogram yt-dlp
+
+Çalıştırma:
+    python linkdrop_bot.py
+
+Not: Aşağıdaki BOT_TOKEN alanını kendi tokeninle değiştir, ya da
+BOT_TOKEN ortam değişkeni olarak set et (tercih edilen, daha güvenli yol).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yt_dlp
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+# =========================================================================
+# 1) KONFİQURASİYA
+# =========================================================================
+
+# Tokeni birbaşa buraya yaza bilərsən (sürətli test üçün) və ya
+# terminalda: export BOT_TOKEN="..." yazıb ortam dəyişəni kimi ver (daha təhlükəsiz).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8969379656:AAFsdiRxoHylAcKswlf9unRYu9anPVPAF7g")
+
+# Admin Telegram user ID-ləri (bura öz ID-ni yaz ki /stats, /broadcast işləsin)
+# Öz ID-ni öyrənmək üçün Telegram-da @userinfobot-a yaz.
+ADMIN_IDS: list[int] = []  # məsələn: [123456789]
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+DB_PATH = BASE_DIR / "linkdrop.db"
+
+MAX_FILE_SIZE_MB = 50
+DOWNLOAD_TIMEOUT_SECONDS = 120
+RATE_LIMIT_SECONDS = 3.0          # ardıcıl sorğular arası minimum fasilə
+MAX_REQUESTS_PER_MINUTE = 15      # istifadəçi başına dəqiqəlik limit
+DEFAULT_LANGUAGE = "az"
+
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# =========================================================================
+# 2) LOGGING
+# =========================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logger = logging.getLogger("linkdrop")
+
+# =========================================================================
+# 3) VERİLƏNLƏR BAZASI (sqlite3, sadəlik üçün senkron + thread-safe wrapper)
+# =========================================================================
+
+_db_lock = asyncio.Lock()
+
+
+@contextmanager
+def _connect():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _init_db_sync() -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                language TEXT NOT NULL DEFAULT 'az',
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                joined_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS download_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+
+async def init_db() -> None:
+    async with _db_lock:
+        await asyncio.to_thread(_init_db_sync)
+    logger.info("Verilənlər bazası hazır: %s", DB_PATH)
+
+
+async def get_or_create_user(user_id: int, username: str | None, first_name: str | None) -> sqlite3.Row:
+    def _work() -> sqlite3.Row:
+        with _connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO users (id, username, first_name, language) VALUES (?, ?, ?, ?)",
+                    (user_id, username, first_name, DEFAULT_LANGUAGE),
+                )
+                row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            else:
+                conn.execute(
+                    "UPDATE users SET username = ?, first_name = ? WHERE id = ?",
+                    (username, first_name, user_id),
+                )
+            return row
+
+    async with _db_lock:
+        return await asyncio.to_thread(_work)
+
+
+async def set_user_language(user_id: int, language: str) -> None:
+    def _work() -> None:
+        with _connect() as conn:
+            conn.execute("UPDATE users SET language = ? WHERE id = ?", (language, user_id))
+
+    async with _db_lock:
+        await asyncio.to_thread(_work)
+
+
+async def set_user_blocked(user_id: int, blocked: bool) -> bool:
+    def _work() -> bool:
+        with _connect() as conn:
+            row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row is None:
+                return False
+            conn.execute("UPDATE users SET is_blocked = ? WHERE id = ?", (int(blocked), user_id))
+            return True
+
+    async with _db_lock:
+        return await asyncio.to_thread(_work)
+
+
+async def get_all_active_user_ids() -> list[int]:
+    def _work() -> list[int]:
+        with _connect() as conn:
+            rows = conn.execute("SELECT id FROM users WHERE is_blocked = 0").fetchall()
+            return [r["id"] for r in rows]
+
+    async with _db_lock:
+        return await asyncio.to_thread(_work)
+
+
+async def log_download(user_id: int, platform: str, url: str, status: str, error_message: str | None = None) -> None:
+    def _work() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO download_logs (user_id, platform, url, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                (user_id, platform, url, status, error_message),
+            )
+
+    async with _db_lock:
+        await asyncio.to_thread(_work)
+
+
+async def get_stats() -> dict:
+    def _work() -> dict:
+        with _connect() as conn:
+            total_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            total_downloads = conn.execute("SELECT COUNT(*) c FROM download_logs").fetchone()["c"]
+            today = conn.execute(
+                "SELECT COUNT(*) c FROM download_logs WHERE date(created_at) = date('now')"
+            ).fetchone()["c"]
+            success = conn.execute(
+                "SELECT COUNT(*) c FROM download_logs WHERE status = 'success'"
+            ).fetchone()["c"]
+            by_platform = conn.execute(
+                "SELECT platform, COUNT(*) c FROM download_logs GROUP BY platform"
+            ).fetchall()
+            rate = round((success / total_downloads) * 100, 2) if total_downloads else 0.0
+            return {
+                "total_users": total_users,
+                "total_downloads": total_downloads,
+                "today": today,
+                "success_rate": rate,
+                "by_platform": {r["platform"]: r["c"] for r in by_platform},
+            }
+
+    async with _db_lock:
+        return await asyncio.to_thread(_work)
+
+
+# =========================================================================
+# 4) ÇOX DİLLİ MƏTNLƏR (AZ / TR / EN)
+# =========================================================================
+
+TEXTS: dict[str, dict[str, str]] = {
+    "welcome": {
+        "az": "👋 Salam, {name}!\n\nMən <b>LinkDrop</b> botuyam. TikTok, Instagram, YouTube Shorts, Facebook və X (Twitter) linklərini göndər, videonu endirim.\n\nKömək üçün /help yaz.",
+        "tr": "👋 Merhaba, {name}!\n\nBen <b>LinkDrop</b> botuyum. TikTok, Instagram, YouTube Shorts, Facebook ve X (Twitter) linklerini gönder, videoyu indireyim.\n\nYardım için /help yaz.",
+        "en": "👋 Hello, {name}!\n\nI'm <b>LinkDrop</b>. Send a link from TikTok, Instagram, YouTube Shorts, Facebook or X (Twitter) and I'll download it.\n\nType /help for help.",
+    },
+    "help": {
+        "az": "ℹ️ Video linkini göndər, mən endirib sənə göndərəcəm.\nDəstəklənən: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nDil dəyişmək üçün: /language",
+        "tr": "ℹ️ Video linkini gönder, ben indirip sana göndereceğim.\nDesteklenen: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nDil değiştirmek için: /language",
+        "en": "ℹ️ Send a video link and I'll fetch it for you.\nSupported: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nTo change language: /language",
+    },
+    "choose_language": {"az": "🌐 Dilinizi seçin:", "tr": "🌐 Dilinizi seçin:", "en": "🌐 Choose your language:"},
+    "language_set": {"az": "✅ Dil Azərbaycan dilinə dəyişdirildi.", "tr": "✅ Dil Türkçe olarak değiştirildi.", "en": "✅ Language set to English."},
+    "preparing": {"az": "⏳ Video hazırlanır, gözləyin...", "tr": "⏳ Video hazırlanıyor, bekleyin...", "en": "⏳ Preparing your video..."},
+    "invalid_link": {
+        "az": "❌ Bu link dəstəklənmir. Dəstəklənən: TikTok, Instagram, YouTube Shorts, Facebook, X",
+        "tr": "❌ Bu link desteklenmiyor. Desteklenen: TikTok, Instagram, YouTube Shorts, Facebook, X",
+        "en": "❌ Link not supported. Supported: TikTok, Instagram, YouTube Shorts, Facebook, X",
+    },
+    "no_url_found": {"az": "🔗 Zəhmət olmasa video linki göndər.", "tr": "🔗 Lütfen bir video linki gönder.", "en": "🔗 Please send a video link."},
+    "download_failed": {"az": "⚠️ Video endirilmədi. Link məhdud/silinmiş ola bilər.", "tr": "⚠️ Video indirilemedi. Link kısıtlı/silinmiş olabilir.", "en": "⚠️ Download failed. The link may be private or deleted."},
+    "file_too_large": {"az": "⚠️ Video çox böyükdür (limit: {limit} MB).", "tr": "⚠️ Video çok büyük (limit: {limit} MB).", "en": "⚠️ Video too large (limit: {limit} MB)."},
+    "blocked": {"az": "🚫 Botdan istifadə etməkdən məhrum edilmisiniz.", "tr": "🚫 Bottan yararlanmanız engellendi.", "en": "🚫 You are blocked from using this bot."},
+    "rate_limited": {"az": "⏱ Çox tez sorğu göndərirsiniz, gözləyin.", "tr": "⏱ Çok hızlı istek gönderiyorsun, bekle.", "en": "⏱ Too many requests, please slow down."},
+    "success_caption": {"az": "✅ Buyurun! 🎬 Platform: {platform}", "tr": "✅ Buyurun! 🎬 Platform: {platform}", "en": "✅ Here you go! 🎬 Platform: {platform}"},
+    "admin_only": {"az": "⛔ Bu əmr yalnız adminlər üçündür.", "tr": "⛔ Bu komut sadece yöneticiler içindir.", "en": "⛔ Admins only."},
+    "user_not_found": {"az": "❌ İstifadəçi tapılmadı.", "tr": "❌ Kullanıcı bulunamadı.", "en": "❌ User not found."},
+    "blocked_ok": {"az": "✅ İstifadəçi {uid} bloklandı.", "tr": "✅ Kullanıcı {uid} engellendi.", "en": "✅ User {uid} blocked."},
+    "unblocked_ok": {"az": "✅ İstifadəçi {uid} blokdan çıxarıldı.", "tr": "✅ Kullanıcı {uid} engeli kaldırıldı.", "en": "✅ User {uid} unblocked."},
+    "broadcast_usage": {"az": "İstifadə: /broadcast <mesaj>", "tr": "Kullanım: /broadcast <mesaj>", "en": "Usage: /broadcast <message>"},
+    "broadcast_done": {"az": "📢 Tamamlandı. Göndərildi: {sent}, Uğursuz: {failed}", "tr": "📢 Tamamlandı. Gönderildi: {sent}, Başarısız: {failed}", "en": "📢 Done. Sent: {sent}, Failed: {failed}"},
+}
+
+
+def t(key: str, lang: str, **kwargs) -> str:
+    lang = lang if lang in ("az", "tr", "en") else DEFAULT_LANGUAGE
+    template = TEXTS.get(key, {}).get(lang) or TEXTS.get(key, {}).get("en") or key
+    return template.format(**kwargs) if kwargs else template
+
+
+# =========================================================================
+# 5) LİNK ALQORİTMASI (allow-list əsaslı platform algılama)
+# =========================================================================
+
+ALLOWED_DOMAINS: dict[str, tuple[str, ...]] = {
+    "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+    "instagram": ("instagram.com", "instagr.am"),
+    "youtube": ("youtube.com", "youtu.be", "m.youtube.com"),
+    "facebook": ("facebook.com", "fb.watch", "m.facebook.com"),
+    "twitter": ("twitter.com", "x.com"),
+}
+
+_URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+
+
+def extract_url(text: str) -> str | None:
+    if not text:
+        return None
+    match = _URL_PATTERN.search(text.strip())
+    return match.group(0) if match else None
+
+
+def detect_platform(url: str) -> str:
+    try:
+        hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return "unknown"
+    for platform, domains in ALLOWED_DOMAINS.items():
+        if any(hostname == d or hostname.endswith("." + d) for d in domains):
+            return platform
+    return "unknown"
+
+
+def is_supported_url(url: str) -> bool:
+    return detect_platform(url) != "unknown"
+
+
+# =========================================================================
+# 6) VİDEO ENDİRMƏ (yt-dlp, thread-də işləyir ki event loop bloklanmasın)
+# =========================================================================
+
+class DownloadError(Exception):
+    pass
+
+
+class FileTooLargeError(DownloadError):
+    pass
+
+
+@dataclass(slots=True)
+class DownloadResult:
+    file_path: Path
+    file_size_bytes: int
+
+
+_download_semaphore = asyncio.Semaphore(10)
+
+
+def _download_sync(url: str) -> DownloadResult:
+    unique_id = uuid.uuid4().hex[:10]
+    output_template = str(DOWNLOADS_DIR / f"{unique_id}_%(id)s.%(ext)s")
+    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    ydl_opts = {
+        "outtmpl": output_template,
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "max_filesize": max_bytes,
+        "retries": 2,
+        "socket_timeout": DOWNLOAD_TIMEOUT_SECONDS,
+        "merge_output_format": "mp4",
+        "restrictfilenames": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise DownloadError("Video məlumatı alınamadı.")
+            file_path = Path(ydl.prepare_filename(info))
+    except yt_dlp.utils.DownloadError as exc:
+        message = str(exc)
+        logger.warning("yt-dlp xətası: %s | url=%s", message, url)
+        if "max-filesize" in message.lower() or "too large" in message.lower():
+            raise FileTooLargeError(message) from exc
+        raise DownloadError(message) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Gözlənilməz endirmə xətası: url=%s", url)
+        raise DownloadError(str(exc)) from exc
+
+    if not file_path.exists():
+        raise DownloadError("Endirilən fayl tapılmadı.")
+
+    file_size = file_path.stat().st_size
+    if file_size > max_bytes:
+        file_path.unlink(missing_ok=True)
+        raise FileTooLargeError(f"Fayl limiti aşır: {file_size} bytes")
+
+    return DownloadResult(file_path=file_path, file_size_bytes=file_size)
+
+
+async def download_video(url: str) -> DownloadResult:
+    async with _download_semaphore:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_download_sync, url), timeout=DOWNLOAD_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            raise DownloadError("Endirmə vaxtı bitdi.") from exc
+
+
+def cleanup_file(file_path: Path) -> None:
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Fayl silinmədi: %s", file_path)
+
+
+# =========================================================================
+# 7) RATE LIMIT / FLOOD QORUMASI (yaddaşda saxlanan sadə həll)
+# =========================================================================
+
+_last_request: dict[int, float] = {}
+_request_windows: dict[int, list[float]] = {}
+
+
+def is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+
+    last = _last_request.get(user_id, 0.0)
+    if now - last < RATE_LIMIT_SECONDS:
+        return True
+    _last_request[user_id] = now
+
+    window = _request_windows.setdefault(user_id, [])
+    window.append(now)
+    window[:] = [ts for ts in window if now - ts <= 60]
+    return len(window) > MAX_REQUESTS_PER_MINUTE
+
+
+# =========================================================================
+# 8) KLAVİATURA
+# =========================================================================
+
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇦🇿 Azərbaycanca", callback_data="lang:az"),
+                InlineKeyboardButton(text="🇹🇷 Türkçe", callback_data="lang:tr"),
+            ],
+            [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en")],
+        ]
+    )
+
+
+# =========================================================================
+# 9) BOT / DISPATCHER VƏ HANDLER-LƏR
+# =========================================================================
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+@dp.message(CommandStart())
+async def handle_start(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if user["is_blocked"]:
+        await message.answer(t("blocked", user["language"]))
+        return
+    name = message.from_user.first_name or "dostum"
+    await message.answer(t("welcome", user["language"], name=name))
+
+
+@dp.message(Command("help"))
+async def handle_help(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if user["is_blocked"]:
+        await message.answer(t("blocked", user["language"]))
+        return
+    await message.answer(t("help", user["language"]))
+
+
+@dp.message(Command("language"))
+async def handle_language(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    await message.answer(t("choose_language", user["language"]), reply_markup=language_keyboard())
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def handle_language_callback(callback: CallbackQuery) -> None:
+    lang_code = callback.data.split(":", maxsplit=1)[1]
+    await set_user_language(callback.from_user.id, lang_code)
+    await callback.message.edit_text(t("language_set", lang_code))
+    await callback.answer()
+
+
+@dp.message(Command("stats"))
+async def handle_stats(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        await message.answer(t("admin_only", user["language"]))
+        return
+    stats = await get_stats()
+    lines = "\n".join(f"  • {p}: {c}" for p, c in stats["by_platform"].items()) or "  —"
+    text = (
+        "📊 <b>LinkDrop İstatistikləri</b>\n\n"
+        f"👥 Toplam istifadəçi: <b>{stats['total_users']}</b>\n"
+        f"⬇️ Toplam endirmə: <b>{stats['total_downloads']}</b>\n"
+        f"📅 Bugünkü: <b>{stats['today']}</b>\n"
+        f"✅ Uğur nisbəti: <b>{stats['success_rate']}%</b>\n\n"
+        f"📱 Platform üzrə:\n{lines}"
+    )
+    await message.answer(text)
+
+
+@dp.message(Command("block"))
+async def handle_block(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if not is_admin(message.from_user.id):
+        await message.answer(t("admin_only", user["language"]))
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("İstifadə: /block <user_id>")
+        return
+    target_id = int(parts[1])
+    ok = await set_user_blocked(target_id, True)
+    await message.answer(t("blocked_ok", user["language"], uid=target_id) if ok else t("user_not_found", user["language"]))
+
+
+@dp.message(Command("unblock"))
+async def handle_unblock(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if not is_admin(message.from_user.id):
+        await message.answer(t("admin_only", user["language"]))
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("İstifadə: /unblock <user_id>")
+        return
+    target_id = int(parts[1])
+    ok = await set_user_blocked(target_id, False)
+    await message.answer(t("unblocked_ok", user["language"], uid=target_id) if ok else t("user_not_found", user["language"]))
+
+
+@dp.message(Command("broadcast"))
+async def handle_broadcast(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if not is_admin(message.from_user.id):
+        await message.answer(t("admin_only", user["language"]))
+        return
+    text = (message.text or "").partition(" ")[2].strip()
+    if not text:
+        await message.answer(t("broadcast_usage", user["language"]))
+        return
+    user_ids = await get_all_active_user_ids()
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception:  # noqa: BLE001
+            failed += 1
+        await asyncio.sleep(0.05)
+    await message.answer(t("broadcast_done", user["language"], sent=sent, failed=failed))
+
+
+@dp.message(F.text)
+async def handle_text_message(message: Message) -> None:
+    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+
+    if user["is_blocked"]:
+        await message.answer(t("blocked", user["language"]))
+        return
+
+    if is_rate_limited(message.from_user.id):
+        await message.answer(t("rate_limited", user["language"]))
+        return
+
+    lang = user["language"]
+    raw_url = extract_url(message.text or "")
+
+    if raw_url is None:
+        await message.answer(t("no_url_found", lang))
+        return
+
+    url = raw_url.strip().strip("<>\"'")
+
+    if not is_supported_url(url):
+        await message.answer(t("invalid_link", lang))
+        return
+
+    platform = detect_platform(url)
+    status_message = await message.answer(t("preparing", lang))
+
+    try:
+        result = await download_video(url)
+    except FileTooLargeError:
+        await status_message.edit_text(t("file_too_large", lang, limit=MAX_FILE_SIZE_MB))
+        await log_download(message.from_user.id, platform, url, "rejected", "file_too_large")
+        return
+    except DownloadError as exc:
+        await status_message.edit_text(t("download_failed", lang))
+        await log_download(message.from_user.id, platform, url, "failed", str(exc)[:500])
+        return
+
+    try:
+        await message.answer_video(
+            video=FSInputFile(result.file_path),
+            caption=t("success_caption", lang, platform=platform),
+        )
+        await status_message.delete()
+        await log_download(message.from_user.id, platform, url, "success")
+    finally:
+        cleanup_file(result.file_path)
+
+
+# =========================================================================
+# 10) BAŞLADICI
+# =========================================================================
+
+async def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN.startswith("your_"):
+        raise SystemExit("BOT_TOKEN təyin olunmayıb. Skriptin başındakı BOT_TOKEN dəyişənini doldur.")
+
+    await init_db()
+    logger.info("LinkDrop botu başladılır...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("LinkDrop dayandırıldı.")
