@@ -63,6 +63,15 @@ ADMIN_IDS: list[int] = []  # məsələn: [123456789]
 # Təhlükəsizlik üçün bu kodu dəyişməyi tövsiyə edirik.
 ADMIN_CODE = "zenty001"
 
+# Reklam bölümü: video göndərildikdən sonra istifadəçiyə göstərilən kiçik reklam.
+# Admin panelindən söndürüb-yandırmaq mümkündür (aşağıda AD_ENABLED runtime dəyəri).
+AD_LINK = "https://t.me/standoff2hack389"
+AD_TEXT: dict[str, str] = {
+    "az": "🎮 Pulsuz Standoff 2 / PUBG Hile — kanala qoşul",
+    "tr": "🎮 Ücretsiz Standoff 2 / PUBG Hile — kanala katıl",
+    "en": "🎮 Free Standoff 2 / PUBG Hack — join the channel",
+}
+
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DB_PATH = BASE_DIR / "linkdrop.db"
@@ -534,6 +543,7 @@ def language_keyboard() -> InlineKeyboardMarkup:
 
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    ads_label = "📣 Reklamı söndür" if ads_enabled else "📣 Reklamı yandır"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Statistika", callback_data="panel:stats")],
@@ -542,8 +552,15 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🚫 Blokla", callback_data="panel:block"),
                 InlineKeyboardButton(text="✅ Blokdan çıxar", callback_data="panel:unblock"),
             ],
+            [InlineKeyboardButton(text=ads_label, callback_data="panel:toggle_ads")],
             [InlineKeyboardButton(text="✖️ Bağla", callback_data="panel:close")],
         ]
+    )
+
+
+def ad_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=AD_TEXT.get(lang, AD_TEXT["az"]), url=AD_LINK)]]
     )
 
 
@@ -633,6 +650,9 @@ async def handle_language_callback(callback: CallbackQuery) -> None:
 # Admin panelinin "növbəti mesajı gözləyən" vəziyyəti (broadcast/block/unblock üçün)
 admin_pending: dict[int, str] = {}
 
+# Reklamın aktiv olub-olmadığı — admin panelindən "Reklamı söndür/yandır" ilə dəyişilir
+ads_enabled: bool = True
+
 
 @dp.message(Command("panel"))
 async def handle_panel(message: Message) -> None:
@@ -687,6 +707,13 @@ async def handle_panel_callback(callback: CallbackQuery) -> None:
         admin_pending[callback.from_user.id] = "unblock"
         await callback.message.answer(t("panel_ask_unblock", lang))
         await callback.answer()
+
+    elif action == "toggle_ads":
+        global ads_enabled
+        ads_enabled = not ads_enabled
+        status_text = "yandırıldı ✅" if ads_enabled else "söndürüldü ❌"
+        await callback.message.edit_text(t("panel_title", lang), reply_markup=admin_panel_keyboard())
+        await callback.answer(f"Reklam {status_text}", show_alert=False)
 
     elif action == "close":
         admin_pending.pop(callback.from_user.id, None)
@@ -858,6 +885,8 @@ async def handle_text_message(message: Message) -> None:
         )
         await status_message.delete()
         await log_download(message.from_user.id, platform, url, "success")
+        if ads_enabled:
+            await message.answer(AD_TEXT.get(lang, AD_TEXT["az"]), reply_markup=ad_keyboard(lang))
     finally:
         cleanup_file(result.file_path)
 
