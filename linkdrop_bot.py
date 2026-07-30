@@ -1,7 +1,11 @@
 """
-LinkDrop - Tek Dosyalık Telegram Video İndirme Botu
+LinkDrop v1.1 - Tek Dosyalık Telegram Video İndirme Botu
 =====================================================
 TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter) linklerini indirir.
+
+Yenilikler (v1.1):
+  - Telegram sistem diline göre otomatik dil algılama (AZ/TR/EN)
+  - Buton tabanlı admin paneli (/panel): istatistik, broadcast, blokla/blokdan çıkar
 
 Kurulum:
     pip install aiogram yt-dlp
@@ -19,10 +23,12 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -128,14 +134,20 @@ async def init_db() -> None:
     logger.info("Verilənlər bazası hazır: %s", DB_PATH)
 
 
-async def get_or_create_user(user_id: int, username: str | None, first_name: str | None) -> sqlite3.Row:
+async def get_or_create_user(
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+    telegram_language_code: str | None = None,
+) -> sqlite3.Row:
     def _work() -> sqlite3.Row:
         with _connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
+                detected_lang = detect_user_language(telegram_language_code)
                 conn.execute(
                     "INSERT INTO users (id, username, first_name, language) VALUES (?, ?, ?, ?)",
-                    (user_id, username, first_name, DEFAULT_LANGUAGE),
+                    (user_id, username, first_name, detected_lang),
                 )
                 row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             else:
@@ -255,6 +267,32 @@ TEXTS: dict[str, dict[str, str]] = {
     "unblocked_ok": {"az": "✅ İstifadəçi {uid} blokdan çıxarıldı.", "tr": "✅ Kullanıcı {uid} engeli kaldırıldı.", "en": "✅ User {uid} unblocked."},
     "broadcast_usage": {"az": "İstifadə: /broadcast <mesaj>", "tr": "Kullanım: /broadcast <mesaj>", "en": "Usage: /broadcast <message>"},
     "broadcast_done": {"az": "📢 Tamamlandı. Göndərildi: {sent}, Uğursuz: {failed}", "tr": "📢 Tamamlandı. Gönderildi: {sent}, Başarısız: {failed}", "en": "📢 Done. Sent: {sent}, Failed: {failed}"},
+    "panel_title": {
+        "az": "🛠 <b>LinkDrop Admin Panel</b>\n\nAşağıdan bir əməliyyat seç:",
+        "tr": "🛠 <b>LinkDrop Admin Panel</b>\n\nAşağıdan bir işlem seç:",
+        "en": "🛠 <b>LinkDrop Admin Panel</b>\n\nChoose an action below:",
+    },
+    "panel_ask_broadcast": {
+        "az": "📢 Bütün istifadəçilərə göndəriləcək mesajı yaz:",
+        "tr": "📢 Tüm kullanıcılara gönderilecek mesajı yaz:",
+        "en": "📢 Type the message to broadcast to all users:",
+    },
+    "panel_ask_block": {
+        "az": "🚫 Bloklanacaq istifadəçinin Telegram ID-sini yaz:",
+        "tr": "🚫 Engellenecek kullanıcının Telegram ID'sini yaz:",
+        "en": "🚫 Send the Telegram ID of the user to block:",
+    },
+    "panel_ask_unblock": {
+        "az": "✅ Blokdan çıxarılacaq istifadəçinin Telegram ID-sini yaz:",
+        "tr": "✅ Engeli kaldırılacak kullanıcının Telegram ID'sini yaz:",
+        "en": "✅ Send the Telegram ID of the user to unblock:",
+    },
+    "panel_invalid_id": {
+        "az": "❌ Düzgün bir Telegram ID yaz (yalnız rəqəm).",
+        "tr": "❌ Geçerli bir Telegram ID yaz (sadece rakam).",
+        "en": "❌ Please send a valid Telegram ID (numbers only).",
+    },
+    "panel_closed": {"az": "Panel bağlandı.", "tr": "Panel kapatıldı.", "en": "Panel closed."},
 }
 
 
@@ -262,6 +300,18 @@ def t(key: str, lang: str, **kwargs) -> str:
     lang = lang if lang in ("az", "tr", "en") else DEFAULT_LANGUAGE
     template = TEXTS.get(key, {}).get(lang) or TEXTS.get(key, {}).get("en") or key
     return template.format(**kwargs) if kwargs else template
+
+
+def detect_user_language(telegram_language_code: str | None) -> str:
+    """Telegram-ın verdiyi sistem dili kodunu (məs. 'az', 'tr-TR', 'ru') bota uyğun
+    dilə çevirir. Bota naməlum dillər üçün DEFAULT_LANGUAGE-ə düşür (yalnız yeni
+    istifadəçi üçün işlədilir — mövcud istifadəçinin dilini dəyişmir)."""
+    if not telegram_language_code:
+        return DEFAULT_LANGUAGE
+    code = telegram_language_code.lower().split("-")[0]
+    if code in ("az", "tr", "en"):
+        return code
+    return DEFAULT_LANGUAGE
 
 
 # =========================================================================
@@ -422,6 +472,20 @@ def language_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="panel:stats")],
+            [InlineKeyboardButton(text="📢 Broadcast", callback_data="panel:broadcast")],
+            [
+                InlineKeyboardButton(text="🚫 Blokla", callback_data="panel:block"),
+                InlineKeyboardButton(text="✅ Blokdan çıxar", callback_data="panel:unblock"),
+            ],
+            [InlineKeyboardButton(text="✖️ Bağla", callback_data="panel:close")],
+        ]
+    )
+
+
 # =========================================================================
 # 9) BOT / DISPATCHER VƏ HANDLER-LƏR
 # =========================================================================
@@ -436,7 +500,10 @@ def is_admin(user_id: int) -> bool:
 
 @dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     if user["is_blocked"]:
         await message.answer(t("blocked", user["language"]))
         return
@@ -446,7 +513,10 @@ async def handle_start(message: Message) -> None:
 
 @dp.message(Command("help"))
 async def handle_help(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     if user["is_blocked"]:
         await message.answer(t("blocked", user["language"]))
         return
@@ -455,7 +525,10 @@ async def handle_help(message: Message) -> None:
 
 @dp.message(Command("language"))
 async def handle_language(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     await message.answer(t("choose_language", user["language"]), reply_markup=language_keyboard())
 
 
@@ -467,10 +540,77 @@ async def handle_language_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# Admin panelinin "növbəti mesajı gözləyən" vəziyyəti (broadcast/block/unblock üçün)
+admin_pending: dict[int, str] = {}
+
+
+@dp.message(Command("panel"))
+async def handle_panel(message: Message) -> None:
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
+    if not is_admin(message.from_user.id):
+        await message.answer(t("admin_only", user["language"]))
+        return
+    await message.answer(t("panel_title", user["language"]), reply_markup=admin_panel_keyboard())
+
+
+@dp.callback_query(F.data.startswith("panel:"))
+async def handle_panel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer(t("admin_only", DEFAULT_LANGUAGE), show_alert=True)
+        return
+
+    user = await get_or_create_user(
+        callback.from_user.id, callback.from_user.username, callback.from_user.first_name,
+        callback.from_user.language_code,
+    )
+    lang = user["language"]
+    action = callback.data.split(":", maxsplit=1)[1]
+
+    if action == "stats":
+        stats = await get_stats()
+        lines = "\n".join(f"  • {p}: {c}" for p, c in stats["by_platform"].items()) or "  —"
+        text = (
+            "📊 <b>LinkDrop İstatistikləri</b>\n\n"
+            f"👥 Toplam istifadəçi: <b>{stats['total_users']}</b>\n"
+            f"⬇️ Toplam endirmə: <b>{stats['total_downloads']}</b>\n"
+            f"📅 Bugünkü: <b>{stats['today']}</b>\n"
+            f"✅ Uğur nisbəti: <b>{stats['success_rate']}%</b>\n\n"
+            f"📱 Platform üzrə:\n{lines}"
+        )
+        await callback.message.answer(text)
+        await callback.answer()
+
+    elif action == "broadcast":
+        admin_pending[callback.from_user.id] = "broadcast"
+        await callback.message.answer(t("panel_ask_broadcast", lang))
+        await callback.answer()
+
+    elif action == "block":
+        admin_pending[callback.from_user.id] = "block"
+        await callback.message.answer(t("panel_ask_block", lang))
+        await callback.answer()
+
+    elif action == "unblock":
+        admin_pending[callback.from_user.id] = "unblock"
+        await callback.message.answer(t("panel_ask_unblock", lang))
+        await callback.answer()
+
+    elif action == "close":
+        admin_pending.pop(callback.from_user.id, None)
+        await callback.message.edit_text(t("panel_closed", lang))
+        await callback.answer()
+
+
 @dp.message(Command("stats"))
 async def handle_stats(message: Message) -> None:
     if not is_admin(message.from_user.id):
-        user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        user = await get_or_create_user(
+            message.from_user.id, message.from_user.username, message.from_user.first_name,
+            message.from_user.language_code,
+        )
         await message.answer(t("admin_only", user["language"]))
         return
     stats = await get_stats()
@@ -488,7 +628,10 @@ async def handle_stats(message: Message) -> None:
 
 @dp.message(Command("block"))
 async def handle_block(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     if not is_admin(message.from_user.id):
         await message.answer(t("admin_only", user["language"]))
         return
@@ -503,7 +646,10 @@ async def handle_block(message: Message) -> None:
 
 @dp.message(Command("unblock"))
 async def handle_unblock(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     if not is_admin(message.from_user.id):
         await message.answer(t("admin_only", user["language"]))
         return
@@ -518,7 +664,10 @@ async def handle_unblock(message: Message) -> None:
 
 @dp.message(Command("broadcast"))
 async def handle_broadcast(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
     if not is_admin(message.from_user.id):
         await message.answer(t("admin_only", user["language"]))
         return
@@ -540,17 +689,52 @@ async def handle_broadcast(message: Message) -> None:
 
 @dp.message(F.text)
 async def handle_text_message(message: Message) -> None:
-    user = await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
+    lang = user["language"]
+
+    # Admin panelindən gələn "növbəti mesajı gözlə" tələbi varsa, əvvəlcə onu emal et
+    pending_action = admin_pending.get(message.from_user.id)
+    if pending_action and is_admin(message.from_user.id):
+        del admin_pending[message.from_user.id]
+        text_value = (message.text or "").strip()
+
+        if pending_action == "broadcast":
+            user_ids = await get_all_active_user_ids()
+            sent, failed = 0, 0
+            for uid in user_ids:
+                try:
+                    await bot.send_message(chat_id=uid, text=text_value)
+                    sent += 1
+                except Exception:  # noqa: BLE001
+                    failed += 1
+                await asyncio.sleep(0.05)
+            await message.answer(t("broadcast_done", lang, sent=sent, failed=failed))
+            return
+
+        if pending_action in ("block", "unblock"):
+            if not text_value.lstrip("-").isdigit():
+                await message.answer(t("panel_invalid_id", lang))
+                return
+            target_id = int(text_value)
+            ok = await set_user_blocked(target_id, pending_action == "block")
+            if ok:
+                key = "blocked_ok" if pending_action == "block" else "unblocked_ok"
+                await message.answer(t(key, lang, uid=target_id))
+            else:
+                await message.answer(t("user_not_found", lang))
+            return
 
     if user["is_blocked"]:
-        await message.answer(t("blocked", user["language"]))
+        await message.answer(t("blocked", lang))
         return
 
     if is_rate_limited(message.from_user.id):
-        await message.answer(t("rate_limited", user["language"]))
+        await message.answer(t("rate_limited", lang))
         return
 
-    lang = user["language"]
     raw_url = extract_url(message.text or "")
 
     if raw_url is None:
@@ -589,13 +773,44 @@ async def handle_text_message(message: Message) -> None:
 
 
 # =========================================================================
-# 10) BAŞLADICI
+# 10) HEALTH-CHECK SERVERİ (yalnız Render/Railway kimi platformalarda lazımdır)
+# =========================================================================
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"LinkDrop bot is running.")
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002 - susdur, botun loglarını qarışdırmasın
+        pass
+
+
+def _start_health_server_if_needed() -> None:
+    """Render/Railway kimi platformalar PORT env dəyişəni verir və açıq port gözləyir.
+    Lokal/Termux işlədərkən PORT təyin olunmadığı üçün bu server işə düşmür."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+
+    def _serve() -> None:
+        server = HTTPServer(("0.0.0.0", int(port)), _HealthCheckHandler)
+        logger.info("Health-check serveri işə düşdü: 0.0.0.0:%s", port)
+        server.serve_forever()
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+
+# =========================================================================
+# 11) BAŞLADICI
 # =========================================================================
 
 async def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN.startswith("your_"):
         raise SystemExit("BOT_TOKEN təyin olunmayıb. Skriptin başındakı BOT_TOKEN dəyişənini doldur.")
 
+    _start_health_server_if_needed()
     await init_db()
     logger.info("LinkDrop botu başladılır...")
     await bot.delete_webhook(drop_pending_updates=True)
