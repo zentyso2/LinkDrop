@@ -5,7 +5,9 @@ TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter) linklerini indirir.
 
 Yenilikler (v1.1):
   - Telegram sistem diline göre otomatik dil algılama (AZ/TR/EN)
-  - Buton tabanlı admin paneli (/panel): istatistik, broadcast, blokla/blokdan çıkar
+  - Buton tabanlı admin paneli (/panel, veya /admin <kod> ile giriş)
+  - Instagram indirme başarısını artırmak için cookie (cookies.txt) ve
+    mobil User-Agent desteği
 
 Kurulum:
     pip install aiogram yt-dlp
@@ -64,6 +66,19 @@ ADMIN_CODE = "zenty001"
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DB_PATH = BASE_DIR / "linkdrop.db"
+
+# Instagram anonim sorğuları getdikcə daha çox rədd edir. Bu fayl mövcuddursa
+# (Netscape formatında, "Get cookies.txt LOCALLY" kimi brauzer əlavəsi ilə
+# ixrac edilmiş), yt-dlp "giriş etmiş" kimi davranır və uğur nisbəti artır.
+# Faylı repo-nun kökünə "cookies.txt" adı ilə əlavə etmək kifayətdir.
+COOKIES_FILE = BASE_DIR / "cookies.txt"
+
+# Bəzi platformalar (xüsusən Instagram) botlara xas User-Agent-ləri rədd edir,
+# ona görə adi bir mobil brauzer User-Agent-i istifadə edirik.
+DOWNLOAD_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+)
 
 MAX_FILE_SIZE_MB = 50
 DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -424,11 +439,17 @@ def _download_sync(url: str) -> DownloadResult:
         "no_warnings": True,
         "noplaylist": True,
         "max_filesize": max_bytes,
-        "retries": 2,
+        "retries": 3,
+        "extractor_retries": 3,
         "socket_timeout": DOWNLOAD_TIMEOUT_SECONDS,
         "merge_output_format": "mp4",
         "restrictfilenames": True,
+        "http_headers": {"User-Agent": DOWNLOAD_USER_AGENT},
     }
+
+    # Cookie faylı varsa (Instagram və digər giriş tələb edən platformalar üçün) istifadə et
+    if COOKIES_FILE.exists():
+        ydl_opts["cookiefile"] = str(COOKIES_FILE)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -882,6 +903,10 @@ async def main() -> None:
     _start_health_server_if_needed()
     await init_db()
     await load_admin_ids_from_db()
+    if COOKIES_FILE.exists():
+        logger.info("Cookie faylı tapıldı: %s (Instagram və s. üçün istifadə olunacaq)", COOKIES_FILE)
+    else:
+        logger.info("Cookie faylı tapılmadı — Instagram-da bəzi videolar rədd oluna bilər.")
     logger.info("LinkDrop botu başladılır... (admin sayı: %d)", len(admin_user_ids))
     await bot.delete_webhook(drop_pending_updates=True)
     try:
