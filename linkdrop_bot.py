@@ -436,7 +436,7 @@ class DownloadResult:
 _download_semaphore = asyncio.Semaphore(10)
 
 
-def _download_sync(url: str) -> DownloadResult:
+def _download_sync(url: str, platform: str) -> DownloadResult:
     unique_id = uuid.uuid4().hex[:10]
     output_template = str(DOWNLOADS_DIR / f"{unique_id}_%(id)s.%(ext)s")
     max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -453,8 +453,13 @@ def _download_sync(url: str) -> DownloadResult:
         "socket_timeout": DOWNLOAD_TIMEOUT_SECONDS,
         "merge_output_format": "mp4",
         "restrictfilenames": True,
-        "http_headers": {"User-Agent": DOWNLOAD_USER_AGENT},
     }
+
+    # Xüsusi mobil User-Agent yalnız Instagram/Facebook üçün tətbiq olunur.
+    # TikTok, YouTube və X-in daxili yt-dlp ekstraktorları öz platformasına uyğun
+    # header/fingerprint-i özü idarə edir — bunu qlobal əvəz etmək onları poza bilər.
+    if platform in ("instagram", "facebook"):
+        ydl_opts["http_headers"] = {"User-Agent": DOWNLOAD_USER_AGENT}
 
     # Cookie faylı varsa (Instagram və digər giriş tələb edən platformalar üçün) istifadə et
     if COOKIES_FILE.exists():
@@ -487,11 +492,11 @@ def _download_sync(url: str) -> DownloadResult:
     return DownloadResult(file_path=file_path, file_size_bytes=file_size)
 
 
-async def download_video(url: str) -> DownloadResult:
+async def download_video(url: str, platform: str) -> DownloadResult:
     async with _download_semaphore:
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(_download_sync, url), timeout=DOWNLOAD_TIMEOUT_SECONDS
+                asyncio.to_thread(_download_sync, url, platform), timeout=DOWNLOAD_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError as exc:
             raise DownloadError("Endirmə vaxtı bitdi.") from exc
@@ -868,7 +873,7 @@ async def handle_text_message(message: Message) -> None:
     status_message = await message.answer(t("preparing", lang))
 
     try:
-        result = await download_video(url)
+        result = await download_video(url, platform)
     except FileTooLargeError:
         await status_message.edit_text(t("file_too_large", lang, limit=MAX_FILE_SIZE_MB))
         await log_download(message.from_user.id, platform, url, "rejected", "file_too_large")
