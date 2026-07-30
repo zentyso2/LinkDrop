@@ -53,9 +53,13 @@ from aiogram.types import (
 # terminalda: export BOT_TOKEN="..." yazıb ortam dəyişəni kimi ver (daha təhlükəsiz).
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8969379656:AAFsdiRxoHylAcKswlf9unRYu9anPVPAF7g")
 
-# Admin Telegram user ID-ləri (bura öz ID-ni yaz ki /stats, /broadcast işləsin)
-# Öz ID-ni öyrənmək üçün Telegram-da @userinfobot-a yaz.
+# Admin Telegram user ID-ləri (bura öz ID-ni yaza bilərsən, amma məcburi deyil —
+# aşağıdakı ADMIN_CODE ilə botda /admin <kod> yazaraq da admin ola bilərsən)
 ADMIN_IDS: list[int] = []  # məsələn: [123456789]
+
+# Bu kodu botda "/admin zenty001" kimi yazan şəxs avtomatik admin olur.
+# Təhlükəsizlik üçün bu kodu dəyişməyi tövsiyə edirik.
+ADMIN_CODE = "zenty001"
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -123,6 +127,14 @@ def _init_db_sync() -> None:
                 status TEXT NOT NULL,
                 error_message TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """
         )
@@ -203,6 +215,34 @@ async def log_download(user_id: int, platform: str, url: str, status: str, error
 
     async with _db_lock:
         await asyncio.to_thread(_work)
+
+
+# Runtime-da bütün admin ID-lərini saxlayan set. Başlanğıcda ADMIN_IDS-dən
+# doldurulur, sonra init_db() içində DB-dən əlavə edilənlər də qoşulur.
+admin_user_ids: set[int] = set(ADMIN_IDS)
+
+
+async def add_admin_to_db(user_id: int) -> None:
+    def _work() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)
+            )
+
+    async with _db_lock:
+        await asyncio.to_thread(_work)
+    admin_user_ids.add(user_id)
+
+
+async def load_admin_ids_from_db() -> None:
+    def _work() -> list[int]:
+        with _connect() as conn:
+            rows = conn.execute("SELECT user_id FROM admins").fetchall()
+            return [r["user_id"] for r in rows]
+
+    async with _db_lock:
+        db_ids = await asyncio.to_thread(_work)
+    admin_user_ids.update(db_ids)
 
 
 async def get_stats() -> dict:
@@ -495,7 +535,36 @@ dp = Dispatcher()
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id in admin_user_ids
+
+
+@dp.message(Command("admin"))
+async def handle_admin_login(message: Message) -> None:
+    """Gizli koda görə istifadəçini admin edir: /admin <kod>"""
+    user = await get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        message.from_user.language_code,
+    )
+    lang = user["language"]
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) != 2:
+        await message.answer("İstifadə: /admin <kod>")
+        return
+
+    entered_code = parts[1].strip()
+    if entered_code != ADMIN_CODE:
+        await message.answer("❌ Kod yanlışdır.")
+        return
+
+    if is_admin(message.from_user.id):
+        await message.answer(t("panel_title", lang), reply_markup=admin_panel_keyboard())
+        return
+
+    await add_admin_to_db(message.from_user.id)
+    logger.info("Yeni admin əlavə edildi: %s", message.from_user.id)
+    await message.answer("✅ Təbriklər, admin oldun!")
+    await message.answer(t("panel_title", lang), reply_markup=admin_panel_keyboard())
 
 
 @dp.message(CommandStart())
@@ -812,7 +881,8 @@ async def main() -> None:
 
     _start_health_server_if_needed()
     await init_db()
-    logger.info("LinkDrop botu başladılır...")
+    await load_admin_ids_from_db()
+    logger.info("LinkDrop botu başladılır... (admin sayı: %d)", len(admin_user_ids))
     await bot.delete_webhook(drop_pending_updates=True)
     try:
         await dp.start_polling(bot)
@@ -825,3 +895,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("LinkDrop dayandırıldı.")
+
