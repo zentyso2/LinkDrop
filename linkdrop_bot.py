@@ -1,7 +1,7 @@
 """
 LinkDrop v1.1 - Tek Dosyalık Telegram Video İndirme Botu
 =====================================================
-TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter) linklerini indirir.
+TikTok, Instagram, YouTube linklerini indirir.
 
 Yenilikler (v1.1):
   - Telegram sistem diline göre otomatik dil algılama (AZ/TR/EN)
@@ -24,7 +24,9 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -162,6 +164,14 @@ def _init_db_sync() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
 
 
 async def init_db() -> None:
@@ -269,6 +279,29 @@ async def load_admin_ids_from_db() -> None:
     admin_user_ids.update(db_ids)
 
 
+async def set_setting(key: str, value: str) -> None:
+    def _work() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    async with _db_lock:
+        await asyncio.to_thread(_work)
+
+
+async def load_settings_from_db() -> dict[str, str]:
+    def _work() -> dict[str, str]:
+        with _connect() as conn:
+            rows = conn.execute("SELECT key, value FROM settings").fetchall()
+            return {r["key"]: r["value"] for r in rows}
+
+    async with _db_lock:
+        return await asyncio.to_thread(_work)
+
+
 async def get_stats() -> dict:
     def _work() -> dict:
         with _connect() as conn:
@@ -302,22 +335,22 @@ async def get_stats() -> dict:
 
 TEXTS: dict[str, dict[str, str]] = {
     "welcome": {
-        "az": "👋 Salam, {name}!\n\nMən <b>LinkDrop</b> botuyam. TikTok, Instagram, YouTube Shorts, Facebook və X (Twitter) linklərini göndər, videonu endirim.\n\nKömək üçün /help yaz.",
-        "tr": "👋 Merhaba, {name}!\n\nBen <b>LinkDrop</b> botuyum. TikTok, Instagram, YouTube Shorts, Facebook ve X (Twitter) linklerini gönder, videoyu indireyim.\n\nYardım için /help yaz.",
-        "en": "👋 Hello, {name}!\n\nI'm <b>LinkDrop</b>. Send a link from TikTok, Instagram, YouTube Shorts, Facebook or X (Twitter) and I'll download it.\n\nType /help for help.",
+        "az": "👋 Salam, {name}!\n\nMən <b>LinkDrop</b> botuyam. TikTok, Instagram və YouTube linklərini göndər, videonu endirim.\n\nKömək üçün /help yaz.",
+        "tr": "👋 Merhaba, {name}!\n\nBen <b>LinkDrop</b> botuyum. TikTok, Instagram ve YouTube linklerini gönder, videoyu indireyim.\n\nYardım için /help yaz.",
+        "en": "👋 Hello, {name}!\n\nI'm <b>LinkDrop</b>. Send a link from TikTok, Instagram or YouTube and I'll download it.\n\nType /help for help.",
     },
     "help": {
-        "az": "ℹ️ Video linkini göndər, mən endirib sənə göndərəcəm.\nDəstəklənən: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nDil dəyişmək üçün: /language",
-        "tr": "ℹ️ Video linkini gönder, ben indirip sana göndereceğim.\nDesteklenen: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nDil değiştirmek için: /language",
-        "en": "ℹ️ Send a video link and I'll fetch it for you.\nSupported: TikTok, Instagram, YouTube Shorts, Facebook, X (Twitter)\nTo change language: /language",
+        "az": "ℹ️ Video linkini göndər, mən endirib sənə göndərəcəm.\nDəstəklənən: TikTok, Instagram, YouTube\nDil dəyişmək üçün: /language",
+        "tr": "ℹ️ Video linkini gönder, ben indirip sana göndereceğim.\nDesteklenen: TikTok, Instagram, YouTube\nDil değiştirmek için: /language",
+        "en": "ℹ️ Send a video link and I'll fetch it for you.\nSupported: TikTok, Instagram, YouTube\nTo change language: /language",
     },
     "choose_language": {"az": "🌐 Dilinizi seçin:", "tr": "🌐 Dilinizi seçin:", "en": "🌐 Choose your language:"},
     "language_set": {"az": "✅ Dil Azərbaycan dilinə dəyişdirildi.", "tr": "✅ Dil Türkçe olarak değiştirildi.", "en": "✅ Language set to English."},
     "preparing": {"az": "⏳ Video hazırlanır, gözləyin...", "tr": "⏳ Video hazırlanıyor, bekleyin...", "en": "⏳ Preparing your video..."},
     "invalid_link": {
-        "az": "❌ Bu link dəstəklənmir. Dəstəklənən: TikTok, Instagram, YouTube Shorts, Facebook, X",
-        "tr": "❌ Bu link desteklenmiyor. Desteklenen: TikTok, Instagram, YouTube Shorts, Facebook, X",
-        "en": "❌ Link not supported. Supported: TikTok, Instagram, YouTube Shorts, Facebook, X",
+        "az": "❌ Bu link dəstəklənmir. Dəstəklənən: TikTok, Instagram, YouTube",
+        "tr": "❌ Bu link desteklenmiyor. Desteklenen: TikTok, Instagram, YouTube",
+        "en": "❌ Link not supported. Supported: TikTok, Instagram, YouTube",
     },
     "no_url_found": {"az": "🔗 Zəhmət olmasa video linki göndər.", "tr": "🔗 Lütfen bir video linki gönder.", "en": "🔗 Please send a video link."},
     "download_failed": {"az": "⚠️ Video endirilmədi. Link məhdud/silinmiş ola bilər.", "tr": "⚠️ Video indirilemedi. Link kısıtlı/silinmiş olabilir.", "en": "⚠️ Download failed. The link may be private or deleted."},
@@ -386,8 +419,6 @@ ALLOWED_DOMAINS: dict[str, tuple[str, ...]] = {
     "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
     "instagram": ("instagram.com", "instagr.am"),
     "youtube": ("youtube.com", "youtu.be", "m.youtube.com"),
-    "facebook": ("facebook.com", "fb.watch", "m.facebook.com"),
-    "twitter": ("twitter.com", "x.com"),
 }
 
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
@@ -455,10 +486,10 @@ def _download_sync(url: str, platform: str) -> DownloadResult:
         "restrictfilenames": True,
     }
 
-    # Xüsusi mobil User-Agent yalnız Instagram/Facebook üçün tətbiq olunur.
-    # TikTok, YouTube və X-in daxili yt-dlp ekstraktorları öz platformasına uyğun
+    # Xüsusi mobil User-Agent yalnız Instagram üçün tətbiq olunur.
+    # TikTok və YouTube-un daxili yt-dlp ekstraktorları öz platformasına uyğun
     # header/fingerprint-i özü idarə edir — bunu qlobal əvəz etmək onları poza bilər.
-    if platform in ("instagram", "facebook"):
+    if platform == "instagram":
         ydl_opts["http_headers"] = {"User-Agent": DOWNLOAD_USER_AGENT}
 
     # Cookie faylı varsa (Instagram və digər giriş tələb edən platformalar üçün) istifadə et
@@ -507,6 +538,39 @@ def cleanup_file(file_path: Path) -> None:
         file_path.unlink(missing_ok=True)
     except OSError:
         logger.warning("Fayl silinmədi: %s", file_path)
+
+
+def _extract_audio_sync(video_path: Path) -> Path | None:
+    """Endirilmiş videodan ffmpeg ilə MP3 audio çıxarır. ffmpeg yoxdursa
+    və ya çıxarma uğursuz olsa None qaytarır (video göndərişini pozmasın deyə)."""
+    if not shutil.which("ffmpeg"):
+        logger.warning("ffmpeg tapılmadı — audio (mp3) çıxarıla bilmir, yalnız video göndəriləcək.")
+        return None
+
+    audio_path = video_path.with_suffix(".mp3")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn", "-acodec", "libmp3lame", "-q:a", "4",
+                str(audio_path),
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Audio çıxarma zamanı gözlənilməz xəta: %s", video_path)
+        return None
+
+    if result.returncode != 0 or not audio_path.exists():
+        logger.warning("ffmpeg audio çıxara bilmədi (kod=%s): %s", result.returncode, video_path)
+        return None
+
+    return audio_path
+
+
+async def extract_audio(video_path: Path) -> Path | None:
+    return await asyncio.to_thread(_extract_audio_sync, video_path)
 
 
 # =========================================================================
@@ -558,15 +622,19 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Blokdan çıxar", callback_data="panel:unblock"),
             ],
             [InlineKeyboardButton(text=ads_label, callback_data="panel:toggle_ads")],
+            [
+                InlineKeyboardButton(text="✏️ Reklam mətni", callback_data="panel:edit_ad_text"),
+                InlineKeyboardButton(text="🔗 Reklam linki", callback_data="panel:edit_ad_link"),
+            ],
             [InlineKeyboardButton(text="✖️ Bağla", callback_data="panel:close")],
         ]
     )
 
 
 def ad_keyboard(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=AD_TEXT.get(lang, AD_TEXT["az"]), url=AD_LINK)]]
-    )
+    text = ad_text_override or AD_TEXT.get(lang, AD_TEXT["az"])
+    link = ad_link_override or AD_LINK
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, url=link)]])
 
 
 # =========================================================================
@@ -658,6 +726,11 @@ admin_pending: dict[int, str] = {}
 # Reklamın aktiv olub-olmadığı — admin panelindən "Reklamı söndür/yandır" ilə dəyişilir
 ads_enabled: bool = True
 
+# Admin panelindən dəyişdirilə bilən reklam mətni/linki. None olduqda
+# faylın başındakı standart AD_TEXT/AD_LINK istifadə olunur.
+ad_text_override: str | None = None
+ad_link_override: str | None = None
+
 
 @dp.message(Command("panel"))
 async def handle_panel(message: Message) -> None:
@@ -719,6 +792,16 @@ async def handle_panel_callback(callback: CallbackQuery) -> None:
         status_text = "yandırıldı ✅" if ads_enabled else "söndürüldü ❌"
         await callback.message.edit_text(t("panel_title", lang), reply_markup=admin_panel_keyboard())
         await callback.answer(f"Reklam {status_text}", show_alert=False)
+
+    elif action == "edit_ad_text":
+        admin_pending[callback.from_user.id] = "edit_ad_text"
+        await callback.message.answer("✏️ Yeni reklam mətnini yaz (bütün istifadəçilərə bu mətn görünəcək):")
+        await callback.answer()
+
+    elif action == "edit_ad_link":
+        admin_pending[callback.from_user.id] = "edit_ad_link"
+        await callback.message.answer("🔗 Yeni reklam linkini yaz (məs. https://t.me/kanal):")
+        await callback.answer()
 
     elif action == "close":
         admin_pending.pop(callback.from_user.id, None)
@@ -849,6 +932,23 @@ async def handle_text_message(message: Message) -> None:
                 await message.answer(t("user_not_found", lang))
             return
 
+        if pending_action == "edit_ad_text":
+            global ad_text_override
+            ad_text_override = text_value
+            await set_setting("ad_text", text_value)
+            await message.answer(f"✅ Reklam mətni yeniləndi:\n\n{text_value}")
+            return
+
+        if pending_action == "edit_ad_link":
+            if not (text_value.startswith("http://") or text_value.startswith("https://")):
+                await message.answer("❌ Link http:// və ya https:// ilə başlamalıdır.")
+                return
+            global ad_link_override
+            ad_link_override = text_value
+            await set_setting("ad_link", text_value)
+            await message.answer(f"✅ Reklam linki yeniləndi:\n{text_value}")
+            return
+
     if user["is_blocked"]:
         await message.answer(t("blocked", lang))
         return
@@ -883,6 +983,7 @@ async def handle_text_message(message: Message) -> None:
         await log_download(message.from_user.id, platform, url, "failed", str(exc)[:500])
         return
 
+    audio_path: Path | None = None
     try:
         await message.answer_video(
             video=FSInputFile(result.file_path),
@@ -890,10 +991,20 @@ async def handle_text_message(message: Message) -> None:
         )
         await status_message.delete()
         await log_download(message.from_user.id, platform, url, "success")
+
+        audio_path = await extract_audio(result.file_path)
+        if audio_path:
+            await message.answer_audio(
+                audio=FSInputFile(audio_path),
+                title=t("success_caption", lang, platform=platform),
+            )
+
         if ads_enabled:
-            await message.answer(AD_TEXT.get(lang, AD_TEXT["az"]), reply_markup=ad_keyboard(lang))
+            await message.answer(ad_text_override or AD_TEXT.get(lang, AD_TEXT["az"]), reply_markup=ad_keyboard(lang))
     finally:
         cleanup_file(result.file_path)
+        if audio_path:
+            cleanup_file(audio_path)
 
 
 # =========================================================================
@@ -937,6 +1048,12 @@ async def main() -> None:
     _start_health_server_if_needed()
     await init_db()
     await load_admin_ids_from_db()
+
+    global ad_text_override, ad_link_override
+    saved_settings = await load_settings_from_db()
+    ad_text_override = saved_settings.get("ad_text")
+    ad_link_override = saved_settings.get("ad_link")
+
     if COOKIES_FILE.exists():
         logger.info("Cookie faylı tapıldı: %s (Instagram və s. üçün istifadə olunacaq)", COOKIES_FILE)
     else:
@@ -954,4 +1071,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("LinkDrop dayandırıldı.")
-
