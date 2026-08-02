@@ -1018,6 +1018,14 @@ class _HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"LinkDrop bot is running.")
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        # UptimeRobot və digər monitorlar bəzən HEAD sorğusu göndərir.
+        # Bunu tətbiq etməsək server 501 (Not Implemented) qaytarır və monitor
+        # botu "down" sayır, halbuki server əslində işləkdir.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - susdur, botun loglarını qarışdırmasın
         pass
 
