@@ -92,7 +92,7 @@ DOWNLOAD_USER_AGENT = (
 )
 
 MAX_FILE_SIZE_MB = 50
-DOWNLOAD_TIMEOUT_SECONDS = 120
+DOWNLOAD_TIMEOUT_SECONDS = 240
 RATE_LIMIT_SECONDS = 3.0          # ardıcıl sorğular arası minimum fasilə
 MAX_REQUESTS_PER_MINUTE = 15      # istifadəçi başına dəqiqəlik limit
 DEFAULT_LANGUAGE = "az"
@@ -474,7 +474,13 @@ def _download_sync(url: str, platform: str) -> DownloadResult:
 
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "best[ext=mp4]/best",
+        # Əvvəlcə 720p-dən aşağı, tək fayl (audio+video birləşmiş) formatı seç —
+        # Telegram-ın 50MB limitinə uyğun və vaxt aşımı riskini azaldır.
+        # Tapılmasa, mövcud ən yaxşı mp4-ə, sonra istənilən formata düşür.
+        "format": (
+            "best[ext=mp4][height<=720][filesize<50M]/"
+            "best[ext=mp4][height<=720]/best[ext=mp4]/best"
+        ),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -1079,3 +1085,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("LinkDrop dayandırıldı.")
+
